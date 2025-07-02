@@ -12,6 +12,7 @@
 (define-data-var next-disaster-id uint u1)
 (define-data-var total-fund-balance uint u0)
 (define-data-var minimum-votes-required uint u3)
+(define-data-var emergency-fund-percentage uint u20)
 
 (define-map disasters
   { disaster-id: uint }
@@ -246,4 +247,75 @@
       none
     )
   )
+)
+
+
+(define-map emergency-disasters
+  { disaster-id: uint }
+  { is-emergency: bool, approved-at: uint }
+)
+
+(define-public (declare-emergency-disaster (disaster-id uint))
+  (let
+    (
+      (disaster-data (map-get? disasters { disaster-id: disaster-id }))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (is-some disaster-data) err-not-found)
+    (asserts! (is-eq (get status (unwrap-panic disaster-data)) "pending") err-voting-closed)
+    (map-set emergency-disasters
+      { disaster-id: disaster-id }
+      { is-emergency: true, approved-at: stacks-block-height }
+    )
+    (ok true)
+  )
+)
+
+(define-public (process-emergency-funding (disaster-id uint))
+  (let
+    (
+      (disaster-data (map-get? disasters { disaster-id: disaster-id }))
+      (emergency-data (map-get? emergency-disasters { disaster-id: disaster-id }))
+      (available-funds (var-get total-fund-balance))
+      (max-emergency-amount (/ (* available-funds (var-get emergency-fund-percentage)) u100))
+    )
+    (asserts! (is-some disaster-data) err-not-found)
+    (asserts! (and (is-some emergency-data) (get is-emergency (unwrap-panic emergency-data))) err-not-authorized)
+    (asserts! (is-eq (get status (unwrap-panic disaster-data)) "pending") err-voting-closed)
+    (let
+      (
+        (requested-amount (get requested-amount (unwrap-panic disaster-data)))
+        (allocation-amount (if (<= requested-amount max-emergency-amount) requested-amount max-emergency-amount))
+      )
+      (asserts! (> allocation-amount u0) err-insufficient-funds)
+      (var-set total-fund-balance (- available-funds allocation-amount))
+      (map-set disasters
+        { disaster-id: disaster-id }
+        (merge (unwrap-panic disaster-data) 
+          { 
+            allocated-amount: allocation-amount,
+            status: "emergency-approved"
+          }
+        )
+      )
+      (ok allocation-amount)
+    )
+  )
+)
+
+(define-public (set-emergency-fund-percentage (percentage uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= percentage u50) err-invalid-amount)
+    (var-set emergency-fund-percentage percentage)
+    (ok percentage)
+  )
+)
+
+(define-read-only (is-emergency-disaster (disaster-id uint))
+  (default-to false (get is-emergency (map-get? emergency-disasters { disaster-id: disaster-id })))
+)
+
+(define-read-only (get-emergency-fund-limit)
+  (/ (* (var-get total-fund-balance) (var-get emergency-fund-percentage)) u100)
 )
