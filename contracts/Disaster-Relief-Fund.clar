@@ -9,6 +9,10 @@
 (define-constant err-voting-closed (err u107))
 (define-constant err-minimum-votes-not-met (err u108))
 
+(define-data-var total-disasters-processed uint u0)
+(define-data-var total-funds-allocated uint u0)
+(define-data-var highest-severity-recorded uint u0)
+
 (define-data-var next-disaster-id uint u1)
 (define-data-var total-fund-balance uint u0)
 (define-data-var minimum-votes-required uint u3)
@@ -318,4 +322,102 @@
 
 (define-read-only (get-emergency-fund-limit)
   (/ (* (var-get total-fund-balance) (var-get emergency-fund-percentage)) u100)
+)
+
+(define-map regional-disaster-history
+  { location: (string-ascii 100) }
+  { 
+    disaster-count: uint,
+    total-severity: uint,
+    total-allocated: uint,
+    last-disaster: uint,
+    risk-score: uint
+  }
+)
+
+(define-map monthly-disaster-stats
+  { year: uint, month: uint }
+  {
+    disaster-count: uint,
+    total-requested: uint,
+    total-allocated: uint,
+    average-severity: uint
+  }
+)
+
+(define-public (update-disaster-metrics (disaster-id uint))
+  (let
+    (
+      (disaster-data (unwrap! (map-get? disasters { disaster-id: disaster-id }) err-not-found))
+      (location (get location disaster-data))
+      (severity (get severity disaster-data))
+      (allocated (get allocated-amount disaster-data))
+      (current-year (/ stacks-block-height u52560))
+      (current-month (/ (mod stacks-block-height u52560) u4380))
+      (existing-regional (default-to 
+        { disaster-count: u0, total-severity: u0, total-allocated: u0, last-disaster: u0, risk-score: u0 }
+        (map-get? regional-disaster-history { location: location })))
+      (existing-monthly (default-to
+        { disaster-count: u0, total-requested: u0, total-allocated: u0, average-severity: u0 }
+        (map-get? monthly-disaster-stats { year: current-year, month: current-month })))
+    )
+    (asserts! (> allocated u0) err-insufficient-funds)
+    (var-set total-disasters-processed (+ (var-get total-disasters-processed) u1))
+    (var-set total-funds-allocated (+ (var-get total-funds-allocated) allocated))
+    (var-set highest-severity-recorded (if (> severity (var-get highest-severity-recorded)) severity (var-get highest-severity-recorded)))
+    (map-set regional-disaster-history
+      { location: location }
+      {
+        disaster-count: (+ (get disaster-count existing-regional) u1),
+        total-severity: (+ (get total-severity existing-regional) severity),
+        total-allocated: (+ (get total-allocated existing-regional) allocated),
+        last-disaster: stacks-block-height,
+        risk-score: (calculate-risk-score location (+ (get disaster-count existing-regional) u1) (+ (get total-severity existing-regional) severity))
+      }
+    )
+    (map-set monthly-disaster-stats
+      { year: current-year, month: current-month }
+      {
+        disaster-count: (+ (get disaster-count existing-monthly) u1),
+        total-requested: (+ (get total-requested existing-monthly) (get requested-amount disaster-data)),
+        total-allocated: (+ (get total-allocated existing-monthly) allocated),
+        average-severity: (/ (+ (* (get average-severity existing-monthly) (get disaster-count existing-monthly)) severity) (+ (get disaster-count existing-monthly) u1))
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-private (calculate-risk-score (location (string-ascii 100)) (disaster-count uint) (total-severity uint))
+  (let
+    (
+      (average-severity (if (> disaster-count u0) (/ total-severity disaster-count) u0))
+      (frequency-factor (if (< (* disaster-count u5) u50) (* disaster-count u5) u50))
+      (severity-factor (if (< (* average-severity u5) u50) (* average-severity u5) u50))
+      (combined-score (+ frequency-factor severity-factor))
+    )
+    (if (< combined-score u100) combined-score u100)
+  )
+)
+
+(define-read-only (get-regional-history (location (string-ascii 100)))
+  (map-get? regional-disaster-history { location: location })
+)
+
+(define-read-only (get-monthly-stats (year uint) (month uint))
+  (map-get? monthly-disaster-stats { year: year, month: month })
+)
+
+(define-read-only (get-global-metrics)
+  {
+    total-disasters: (var-get total-disasters-processed),
+    total-allocated: (var-get total-funds-allocated),
+    highest-severity: (var-get highest-severity-recorded),
+    average-allocation: (if (> (var-get total-disasters-processed) u0) 
+      (/ (var-get total-funds-allocated) (var-get total-disasters-processed)) u0)
+  }
+)
+
+(define-read-only (get-location-risk-score (location (string-ascii 100)))
+  (default-to u0 (get risk-score (map-get? regional-disaster-history { location: location })))
 )
