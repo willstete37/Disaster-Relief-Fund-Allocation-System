@@ -18,6 +18,14 @@
 (define-data-var minimum-votes-required uint u3)
 (define-data-var emergency-fund-percentage uint u20)
 
+(define-constant err-badge-exists (err u109))
+(define-constant err-insufficient-reputation (err u110))
+(define-constant err-reward-claimed (err u111))
+
+(define-data-var total-reputation-points uint u0)
+(define-data-var loyalty-bonus-rate uint u5)
+(define-data-var milestone-reward-amount uint u1000000)
+
 (define-map disasters
   { disaster-id: uint }
   {
@@ -420,4 +428,102 @@
 
 (define-read-only (get-location-risk-score (location (string-ascii 100)))
   (default-to u0 (get risk-score (map-get? regional-disaster-history { location: location })))
+)
+
+
+(define-map donor-reputation
+  { donor: principal }
+  {
+    reputation-score: uint,
+    total-donations: uint,
+    consistency-streak: uint,
+    last-donation-block: uint,
+    loyalty-multiplier: uint
+  }
+)
+
+(define-map donor-badges
+  { donor: principal, badge-type: (string-ascii 20) }
+  { earned-at: uint, milestone-value: uint }
+)
+
+(define-map milestone-rewards
+  { donor: principal, milestone: uint }
+  { claimed: bool, reward-amount: uint }
+)
+
+(define-public (calculate-reputation-score (donor principal))
+  (let
+    (
+      (contribution-data (map-get? fund-contributions { contributor: donor }))
+      (current-rep (default-to 
+        { reputation-score: u0, total-donations: u0, consistency-streak: u0, last-donation-block: u0, loyalty-multiplier: u1 }
+        (map-get? donor-reputation { donor: donor })))
+      (total-contributed (default-to u0 (get total-contributed contribution-data)))
+      (last-contribution (default-to u0 (get last-contribution contribution-data)))
+      (base-score (/ total-contributed u1000))
+      (consistency-bonus (if (and (> last-contribution u0) (<= (- stacks-block-height last-contribution) u144)) u10 u0))
+      (loyalty-multiplier (get loyalty-multiplier current-rep))
+      (final-score (* (+ base-score consistency-bonus) loyalty-multiplier))
+    )
+    (map-set donor-reputation
+      { donor: donor }
+      {
+        reputation-score: final-score,
+        total-donations: total-contributed,
+        consistency-streak: (if (> consistency-bonus u0) (+ (get consistency-streak current-rep) u1) u0),
+        last-donation-block: last-contribution,
+        loyalty-multiplier: (if (>= (get consistency-streak current-rep) u5) (+ loyalty-multiplier u1) loyalty-multiplier)
+      }
+    )
+    (ok final-score)
+  )
+)
+
+(define-public (award-badge (donor principal) (badge-type (string-ascii 20)) (milestone-value uint))
+  (let
+    (
+      (existing-badge (map-get? donor-badges { donor: donor, badge-type: badge-type }))
+      (rep-data (map-get? donor-reputation { donor: donor }))
+    )
+    (asserts! (is-none existing-badge) err-badge-exists)
+    (asserts! (is-some rep-data) err-not-found)
+    (map-set donor-badges
+      { donor: donor, badge-type: badge-type }
+      { earned-at: stacks-block-height, milestone-value: milestone-value }
+    )
+    (ok true)
+  )
+)
+
+(define-public (claim-milestone-reward (milestone uint))
+  (let
+    (
+      (rep-data (unwrap! (map-get? donor-reputation { donor: tx-sender }) err-not-found))
+      (existing-reward (map-get? milestone-rewards { donor: tx-sender, milestone: milestone }))
+      (reward-amount (var-get milestone-reward-amount))
+    )
+    (asserts! (is-none existing-reward) err-reward-claimed)
+    (asserts! (>= (get reputation-score rep-data) (* milestone u100)) err-insufficient-reputation)
+    (asserts! (<= reward-amount (var-get total-fund-balance)) err-insufficient-funds)
+    (map-set milestone-rewards
+      { donor: tx-sender, milestone: milestone }
+      { claimed: true, reward-amount: reward-amount }
+    )
+    (var-set total-fund-balance (- (var-get total-fund-balance) reward-amount))
+    (try! (as-contract (stx-transfer? reward-amount tx-sender tx-sender)))
+    (ok reward-amount)
+  )
+)
+
+(define-read-only (get-donor-reputation (donor principal))
+  (map-get? donor-reputation { donor: donor })
+)
+
+(define-read-only (get-donor-badge (donor principal) (badge-type (string-ascii 20)))
+  (map-get? donor-badges { donor: donor, badge-type: badge-type })
+)
+
+(define-read-only (get-milestone-status (donor principal) (milestone uint))
+  (map-get? milestone-rewards { donor: donor, milestone: milestone })
 )
