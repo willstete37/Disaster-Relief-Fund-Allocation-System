@@ -527,3 +527,109 @@
 (define-read-only (get-milestone-status (donor principal) (milestone uint))
   (map-get? milestone-rewards { donor: donor, milestone: milestone })
 )
+
+
+(define-map fund-escrow
+  { disaster-id: uint }
+  { 
+    total-escrowed: uint,
+    released-amount: uint,
+    milestone-count: uint,
+    current-milestone: uint,
+    escrow-active: bool
+  }
+)
+
+(define-map escrow-milestones
+  { disaster-id: uint, milestone-index: uint }
+  {
+    description: (string-ascii 100),
+    percentage: uint,
+    unlock-block: uint,
+    verified: bool,
+    released: bool
+  }
+)
+
+(define-public (create-escrow-plan (disaster-id uint) (milestone-count uint))
+  (let
+    (
+      (disaster-data (unwrap! (map-get? disasters { disaster-id: disaster-id }) err-not-found))
+      (allocated (get allocated-amount disaster-data))
+    )
+    (asserts! (is-eq tx-sender (get created-by disaster-data)) err-not-authorized)
+    (asserts! (> allocated u0) err-insufficient-funds)
+    (asserts! (and (>= milestone-count u1) (<= milestone-count u5)) err-invalid-amount)
+    (asserts! (is-eq (get status disaster-data) "approved") err-not-authorized)
+    (map-set fund-escrow
+      { disaster-id: disaster-id }
+      { total-escrowed: allocated, released-amount: u0, milestone-count: milestone-count, current-milestone: u0, escrow-active: true }
+    )
+    (ok milestone-count)
+  )
+)
+
+(define-public (set-milestone (disaster-id uint) (milestone-index uint) (description (string-ascii 100)) (percentage uint) (blocks-delay uint))
+  (let
+    (
+      (disaster-data (unwrap! (map-get? disasters { disaster-id: disaster-id }) err-not-found))
+      (escrow-data (unwrap! (map-get? fund-escrow { disaster-id: disaster-id }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get created-by disaster-data)) err-not-authorized)
+    (asserts! (< milestone-index (get milestone-count escrow-data)) err-invalid-amount)
+    (asserts! (<= percentage u100) err-invalid-amount)
+    (map-set escrow-milestones
+      { disaster-id: disaster-id, milestone-index: milestone-index }
+      { description: description, percentage: percentage, unlock-block: (+ stacks-block-height blocks-delay), verified: false, released: false }
+    )
+    (ok true)
+  )
+)
+
+(define-public (verify-milestone (disaster-id uint) (milestone-index uint))
+  (let
+    (
+      (milestone-data (unwrap! (map-get? escrow-milestones { disaster-id: disaster-id, milestone-index: milestone-index }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (>= stacks-block-height (get unlock-block milestone-data)) err-voting-closed)
+    (map-set escrow-milestones
+      { disaster-id: disaster-id, milestone-index: milestone-index }
+      (merge milestone-data { verified: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (release-milestone-funds (disaster-id uint) (milestone-index uint))
+  (let
+    (
+      (disaster-data (unwrap! (map-get? disasters { disaster-id: disaster-id }) err-not-found))
+      (escrow-data (unwrap! (map-get? fund-escrow { disaster-id: disaster-id }) err-not-found))
+      (milestone-data (unwrap! (map-get? escrow-milestones { disaster-id: disaster-id, milestone-index: milestone-index }) err-not-found))
+      (release-amount (/ (* (get total-escrowed escrow-data) (get percentage milestone-data)) u100))
+    )
+    (asserts! (is-eq tx-sender (get created-by disaster-data)) err-not-authorized)
+    (asserts! (get verified milestone-data) err-not-authorized)
+    (asserts! (not (get released milestone-data)) err-already-exists)
+    (asserts! (is-eq milestone-index (get current-milestone escrow-data)) err-invalid-amount)
+    (try! (as-contract (stx-transfer? release-amount tx-sender (get created-by disaster-data))))
+    (map-set escrow-milestones
+      { disaster-id: disaster-id, milestone-index: milestone-index }
+      (merge milestone-data { released: true })
+    )
+    (map-set fund-escrow
+      { disaster-id: disaster-id }
+      (merge escrow-data { released-amount: (+ (get released-amount escrow-data) release-amount), current-milestone: (+ milestone-index u1) })
+    )
+    (ok release-amount)
+  )
+)
+
+(define-read-only (get-escrow-status (disaster-id uint))
+  (map-get? fund-escrow { disaster-id: disaster-id })
+)
+
+(define-read-only (get-milestone-info (disaster-id uint) (milestone-index uint))
+  (map-get? escrow-milestones { disaster-id: disaster-id, milestone-index: milestone-index })
+)
