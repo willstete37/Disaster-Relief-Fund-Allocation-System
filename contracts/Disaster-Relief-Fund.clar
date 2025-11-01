@@ -9,6 +9,14 @@
 (define-constant err-voting-closed (err u107))
 (define-constant err-minimum-votes-not-met (err u108))
 
+(define-constant err-vesting-not-found (err u112))
+(define-constant err-vesting-locked (err u113))
+(define-constant err-vesting-claimed (err u114))
+
+(define-data-var total-vested-funds uint u0)
+(define-data-var early-withdrawal-penalty-rate uint u10)
+(define-data-var next-vesting-id uint u1)
+
 (define-data-var total-disasters-processed uint u0)
 (define-data-var total-funds-allocated uint u0)
 (define-data-var highest-severity-recorded uint u0)
@@ -632,4 +640,111 @@
 
 (define-read-only (get-milestone-info (disaster-id uint) (milestone-index uint))
   (map-get? escrow-milestones { disaster-id: disaster-id, milestone-index: milestone-index })
+)
+
+(define-map vesting-schedules
+  { vesting-id: uint }
+  {
+    contributor: principal,
+    amount: uint,
+    lock-period: uint,
+    start-block: uint,
+    unlock-block: uint,
+    claimed: bool,
+    vesting-multiplier: uint
+  }
+)
+
+(define-map contributor-vesting-ids
+  { contributor: principal, index: uint }
+  { vesting-id: uint }
+)
+
+(define-public (contribute-with-vesting (amount uint) (lock-blocks uint))
+  (let
+    (
+      (vesting-id (var-get next-vesting-id))
+      (unlock-block (+ stacks-block-height lock-blocks))
+      (multiplier (if (>= lock-blocks u14400) u3 (if (>= lock-blocks u7200) u2 u1)))
+    )
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (>= lock-blocks u1440) err-invalid-amount)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (var-set total-fund-balance (+ (var-get total-fund-balance) amount))
+    (var-set total-vested-funds (+ (var-get total-vested-funds) amount))
+    (map-set vesting-schedules
+      { vesting-id: vesting-id }
+      {
+        contributor: tx-sender,
+        amount: amount,
+        lock-period: lock-blocks,
+        start-block: stacks-block-height,
+        unlock-block: unlock-block,
+        claimed: false,
+        vesting-multiplier: multiplier
+      }
+    )
+    (var-set next-vesting-id (+ vesting-id u1))
+    (ok vesting-id)
+  )
+)
+
+(define-public (withdraw-vested-funds (vesting-id uint))
+  (let
+    (
+      (vesting-data (unwrap! (map-get? vesting-schedules { vesting-id: vesting-id }) err-vesting-not-found))
+    )
+    (asserts! (is-eq tx-sender (get contributor vesting-data)) err-not-authorized)
+    (asserts! (not (get claimed vesting-data)) err-vesting-claimed)
+    (asserts! (>= stacks-block-height (get unlock-block vesting-data)) err-vesting-locked)
+    (map-set vesting-schedules
+      { vesting-id: vesting-id }
+      (merge vesting-data { claimed: true })
+    )
+    (var-set total-vested-funds (- (var-get total-vested-funds) (get amount vesting-data)))
+    (try! (as-contract (stx-transfer? (get amount vesting-data) tx-sender (get contributor vesting-data))))
+    (ok (get amount vesting-data))
+  )
+)
+
+(define-public (early-withdraw-with-penalty (vesting-id uint))
+  (let
+    (
+      (vesting-data (unwrap! (map-get? vesting-schedules { vesting-id: vesting-id }) err-vesting-not-found))
+      (penalty (/ (* (get amount vesting-data) (var-get early-withdrawal-penalty-rate)) u100))
+      (withdrawal-amount (- (get amount vesting-data) penalty))
+    )
+    (asserts! (is-eq tx-sender (get contributor vesting-data)) err-not-authorized)
+    (asserts! (not (get claimed vesting-data)) err-vesting-claimed)
+    (asserts! (< stacks-block-height (get unlock-block vesting-data)) err-vesting-not-found)
+    (map-set vesting-schedules
+      { vesting-id: vesting-id }
+      (merge vesting-data { claimed: true })
+    )
+    (var-set total-vested-funds (- (var-get total-vested-funds) (get amount vesting-data)))
+    (try! (as-contract (stx-transfer? withdrawal-amount tx-sender (get contributor vesting-data))))
+    (ok withdrawal-amount)
+  )
+)
+
+(define-read-only (get-vesting-info (vesting-id uint))
+  (map-get? vesting-schedules { vesting-id: vesting-id })
+)
+
+(define-read-only (get-total-vested-funds)
+  (var-get total-vested-funds)
+)
+
+(define-read-only (calculate-vesting-progress (vesting-id uint))
+  (let
+    (
+      (vesting-data (map-get? vesting-schedules { vesting-id: vesting-id }))
+      (elapsed (- stacks-block-height (default-to u0 (get start-block vesting-data))))
+      (total-period (default-to u1 (get lock-period vesting-data)))
+    )
+    (if (is-some vesting-data)
+      (some (if (>= elapsed total-period) u100 (/ (* elapsed u100) total-period)))
+      none
+    )
+  )
 )
